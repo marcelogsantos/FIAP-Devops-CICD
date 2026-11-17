@@ -1,0 +1,185 @@
+---
+stages:
+  - validar
+  - planejar
+  - contrato
+  - deploy
+  - smoke
+
+default:
+  # Cache de providers no home do usuario do runner: o provider AWS tem centenas de
+  # MB e, sem cache, cada job baixaria tudo de novo no terraform init. Fica no
+  # before_script (e nao em variables:) porque $HOME so existe no shell do runner.
+  before_script:
+    - export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+    - mkdir -p "$TF_PLUGIN_CACHE_DIR"
+
+# ---------- STAGE validar ----------
+
+# (seu) fmt-validate: formatacao e sintaxe, sem tocar no state.
+fmt-validate:
+  stage: validar
+  script:
+    - terraform fmt -check -recursive
+    - terraform init -backend=false
+    - terraform validate
+  tags:
+    - shell
+
+# kit: testa o modulo isolado com node_count 1 e 3, sem criar nada.
+tf-test:
+  stage: validar
+  script:
+    - terraform init
+    - terraform workspace select dev || terraform workspace new dev
+    - terraform test
+  tags:
+    - shell
+
+# (seu) checkov: scanner de seguranca de IaC. Reporta sem barrar (|| true):
+# os achados da camada web (HTTP sem TLS, ALB sem WAF, IMDSv1) sao assunto de
+# revisao de seguranca, nao de aula. O relatorio vira suíte na aba Tests.
+checkov:
+  stage: validar
+  script:
+    - source /opt/venv/bin/activate
+    - checkov --directory . --framework terraform -o junitxml > checkov-report.xml || true
+  artifacts:
+    when: always
+    paths:
+      - checkov-report.xml
+    reports:
+      junit: checkov-report.xml
+  tags:
+    - shell
+
+# ---------- STAGE planejar ----------
+
+# (seu) plan-dev: calcula o plano do ambiente dev e publica o arquivo de plano
+# como artefato — o contrato-dev e o deploy-dev leem exatamente esse plano.
+plan-dev:
+  stage: planejar
+  script:
+    - terraform init
+    - terraform workspace select dev || terraform workspace new dev
+    - terraform plan -out=plan-dev.tfplan
+  artifacts:
+    paths:
+      - plan-dev.tfplan
+  tags:
+    - shell
+
+# (seu) plan-prod: mesmo fluxo no ambiente prod.
+plan-prod:
+  stage: planejar
+  script:
+    - terraform init
+    - terraform workspace select prod || terraform workspace new prod
+    - terraform plan -out=plan-prod.tfplan
+  artifacts:
+    paths:
+      - plan-prod.tfplan
+  tags:
+    - shell
+
+# ---------- STAGE contrato ----------
+
+# kit: confere o plan de cada ambiente contra o contrato, antes de qualquer apply.
+contrato-dev:
+  stage: contrato
+  needs: [plan-dev]
+  script:
+    - terraform init
+    - terraform show -json plan-dev.tfplan > plan-dev.json
+    - source /opt/venv/bin/activate
+    - pytest validacao/test_contrato.py --ambiente dev --plan plan-dev.json --junitxml contrato-dev.xml
+  artifacts:
+    when: always
+    paths:
+      - contrato-dev.xml
+    reports:
+      junit: contrato-dev.xml
+  tags:
+    - shell
+
+contrato-prod:
+  stage: contrato
+  needs: [plan-prod]
+  script:
+    - terraform init
+    - terraform show -json plan-prod.tfplan > plan-prod.json
+    - source /opt/venv/bin/activate
+    - pytest validacao/test_contrato.py --ambiente prod --plan plan-prod.json --junitxml contrato-prod.xml
+  artifacts:
+    when: always
+    paths:
+      - contrato-prod.xml
+    reports:
+      junit: contrato-prod.xml
+  tags:
+    - shell
+
+# ---------- STAGE deploy ----------
+
+# (seu) deploy-dev: aplica o plano aprovado pelo contrato. needs baixa o
+# plan-dev.tfplan gerado pelo plan-dev — o apply faz exatamente o que foi aprovado.
+deploy-dev:
+  stage: deploy
+  needs: [plan-dev, contrato-dev]
+  script:
+    - terraform init
+    - terraform workspace select dev
+    - terraform apply -auto-approve plan-dev.tfplan
+  tags:
+    - shell
+
+# (seu) deploy-prod: a promocao. So roda depois que dev subiu e o contrato de
+# prod passou — se dev falhar, prod nao e tocado.
+deploy-prod:
+  stage: deploy
+  needs: [plan-prod, contrato-prod, deploy-dev]
+  script:
+    - terraform init
+    - terraform workspace select prod
+    - terraform apply -auto-approve plan-prod.tfplan
+  tags:
+    - shell
+
+# ---------- STAGE smoke ----------
+
+# kit: testa a infraestrutura publicada pelo DNS do ALB de cada ambiente.
+smoke-dev:
+  stage: smoke
+  needs: [deploy-dev]
+  script:
+    - terraform init
+    - terraform workspace select dev
+    - ALB_DNS=$(terraform output -raw alb_dns)
+    - source /opt/venv/bin/activate
+    - pytest validacao/test_smoke.py --ambiente dev --alb-dns "$ALB_DNS" --junitxml smoke-dev.xml
+  artifacts:
+    when: always
+    paths:
+      - smoke-dev.xml
+    reports:
+      junit: smoke-dev.xml
+  tags:
+    - shell
+
+smoke-prod:
+  stage: smoke
+  needs: [deploy-prod]
+  script:
+    - terraform init
+    - terraform workspace select prod
+    - ALB_DNS=$(terraform output -raw alb_dns)
+    - source /opt/venv/bin/activate
+    - pytest validacao/test_smoke.py --ambiente prod --alb-dns "$ALB_DNS" --junitxml smoke-prod.xml
+  artifacts:
+    when: always
+    paths:
+      - smoke-prod.xml
+    reports:
+      junit: smoke-prod.xml
+  tags:
+    - shell

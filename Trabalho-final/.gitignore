@@ -1,0 +1,11 @@
+# Arquivos locais do Terraform: o state vive no S3 e o plano e artefato do pipeline.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+plan-*.json
+contrato-*.xml
+smoke-*.xml
+checkov-report.xml
+.pytest_cache/
+__pycache__/
